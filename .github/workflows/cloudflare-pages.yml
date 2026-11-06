@@ -1,0 +1,80 @@
+name: Publish ISLE GLOW to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - index.html
+      - .github/workflows/cloudflare-pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isle-glow-cloudflare-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out website
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare single-file website
+        shell: bash
+        run: |
+          test -s index.html || { echo 'Missing root index.html'; exit 1; }
+          mkdir -p pages-upload
+          cp index.html pages-upload/index.html
+
+      - name: Verify Cloudflare project and production branch
+        id: project
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_PROJECT_NAME: ${{ vars.CLOUDFLARE_PROJECT_NAME }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.request, urllib.error
+          token = os.environ.get('CLOUDFLARE_API_TOKEN', '')
+          account = os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')
+          project = os.environ.get('CLOUDFLARE_PROJECT_NAME', '')
+          if not token:
+              sys.exit('Add the CLOUDFLARE_API_TOKEN repository secret first.')
+          if not re.fullmatch(r'[a-fA-F0-9]{32}', account):
+              sys.exit('Add a valid CLOUDFLARE_ACCOUNT_ID repository secret.')
+          if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', project):
+              sys.exit('Set the CLOUDFLARE_PROJECT_NAME repository variable to the exact Pages project name.')
+          url = f'https://api.cloudflare.com/client/v4/accounts/{account}/pages/projects/{project}'
+          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + token})
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as error:
+              sys.exit(f'Cloudflare project check failed (HTTP {error.code}). Verify the account, project name, and Pages token permissions.')
+          except (urllib.error.URLError, TimeoutError):
+              sys.exit('Could not connect to Cloudflare. Retry the workflow.')
+          if not payload.get('success'):
+              sys.exit('Cloudflare did not confirm this project. Nothing was deployed.')
+          branch = payload.get('result', {}).get('production_branch', '')
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}', branch):
+              sys.exit('Could not determine a supported production branch. Nothing was deployed.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('project_name=' + project + '\n')
+              output.write('production_branch=' + branch + '\n')
+          print('Confirmed the existing Pages project and its production branch.')
+          PY
+
+      - name: Publish to the existing Pages project
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy pages-upload --project-name=${{ steps.project.outputs.project_name }} --branch=${{ steps.project.outputs.production_branch }}
